@@ -18,8 +18,7 @@ The project combines dataset preparation, molecular-dynamics simulations, featur
 
 More detailed documentation is available in:
 
-- [`datasetToJson/README.md`](./datasetToJson/README.md): ETL pipeline and
-  MongoDB storage.
+- [`datasetToJson/README.md`](./datasetToJson/README.md): dataset sources, ETL pipeline and MongoDB storage.
 - [`simulations/README.md`](./simulations/README.md): simulation workflows.
 - [`simulations/single_chain/README.md`](./simulations/single_chain/README.md):
   single-chain files and commands.
