@@ -34,8 +34,7 @@ datasets into a common JSON schema and stores the resulting documents in
 MongoDB. Dataset-specific mappings are implemented in
 [`datasetToJson/wrappers/`](./datasetToJson/wrappers/).
 
-The database connection is configured through environment variables. Do not
-commit credentials or local `.env` files.
+The original dataset sources and their access links are documented in the [Dataset sources](./datasetToJson/README.md#dataset-sources) section.
 
 ### 2. Molecular-dynamics features
 
