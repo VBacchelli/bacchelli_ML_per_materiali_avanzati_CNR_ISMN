@@ -6,6 +6,21 @@ heterogeneous polymer datasets into a unified JSON format and store them in Mong
 Each source dataset is processed independently and mapped to a common schema,
 so that data coming from different sources can be queried and used consistently.
 
+## Dataset sources
+
+The ETL pipeline processes polymer datasets obtained from the following external sources:
+
+| Dataset | Source |
+|---|---|
+| Bicerano Polymers | [Hugging Face](https://huggingface.co/datasets/AdrianM0/bicerano_polymers/) |
+| Glass Transition Temperature Dataset | [Springer Nature Figshare](https://springernature.figshare.com/articles/dataset/dataset_with_glass_transition_temperature/24219958?file=42507037) |
+| Extended Polymer Dataset | [Kaggle](https://www.kaggle.com/datasets/ko55584/extended-polymer-dataset) |
+| Extra Dataset with SMILES, Tg, PID and Polymer Class | [Kaggle](https://www.kaggle.com/datasets/linyeping/extra-dataset-with-smilestgpidpolimers-class) |
+
+The original datasets are referenced through their external sources. Dataset-specific wrappers handle column mapping, property normalization and conversion into a common JSON schema.
+
+The availability and redistribution of the original data are subject to the terms and conditions of their respective providers.
+
 ## Overview
 
 The ETL pipeline works as follows:
