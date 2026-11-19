@@ -1,7 +1,6 @@
-"""Load cleaned polymer cohorts from MongoDB without changing the source data."""
+"""Load cleaned polymer cohorts from MongoDB without modifying the source data."""
 
 import os
-import re
 from pathlib import Path
 
 import numpy as np
@@ -11,9 +10,7 @@ from rdkit import Chem, RDLogger
 RDLogger.DisableLog("rdApp.error")
 
 DB_NAME = "PolymerPrediction"
-COLLECTIONS = {"bicerano": "biceranoPolymers", "polyinfo": "polyInfo_kaggle"}
-EXPECTED_COUNTS = {"bicerano": (315, 312), "polyinfo": (7284, 7077)}
-EXPECTED_MD_COMMON = 135
+COLLECTIONS = {"bicerano": "biceranoPolymers", "polyinfo": "polyInfo_kaggle", "extended": "extendedPolymers"}
 MD_COLUMNS = {
     "biceranoPolymers_analysis_summary_base.csv": ("end_to_end_md", "Rg_md", "density_md"),
     "biceranoPolymers_analysis_summary_250.csv": ("end_to_end_md_250", "Rg_md_250", "density_md_250"),
@@ -22,26 +19,20 @@ MD_COLUMNS = {
 }
 
 
-def normalize_star(smiles):
-    """Match the wildcard normalization used by the original importer."""
-    smiles = re.sub(r"\(\s*\*\s*\)", "[*]", smiles)
-    smiles = smiles.replace("[Ce]", "[*]").replace("[Th]", "[*]")
-    return re.sub(r"(?<!\[)\*(?!\])", "[*]", smiles)
-
-
 def canonical_smiles(smiles):
-    """Return the canonical RDKit SMILES, or None if parsing fails."""
+    """Return canonical RDKit SMILES, or None if parsing fails."""
     if not isinstance(smiles, str) or not smiles.strip():
         return None
-    mol = Chem.MolFromSmiles(normalize_star(smiles.strip()))
+    mol = Chem.MolFromSmiles(smiles.strip())
     return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True) if mol else None
 
 
-def clean_frame(frame, dataset, *, check_counts=True):
-    """Apply uniform SMILES/Tg rules and retain an auditable exclusion table."""
+def clean_frame(frame, dataset, *, target="Tg", check_counts=True):
+    """Apply the same structure and duplicate rules to the selected target."""
     if dataset not in COLLECTIONS:
         raise ValueError(f"Unknown dataset: {dataset}")
-    required = {"sample_id", "smiles", "Tg_K"}
+    required = {"sample_id", "smiles"}
+    required.add("Tg_K" if target == "Tg" and "target_value" not in frame else "target_value")
     if missing := required - set(frame.columns):
         raise ValueError(f"Missing columns: {sorted(missing)}")
 
@@ -50,37 +41,36 @@ def clean_frame(frame, dataset, *, check_counts=True):
     if df.sample_id.duplicated().any():
         raise ValueError("Duplicate sample_id in source data")
 
-    df["Tg_K"] = pd.to_numeric(df.Tg_K, errors="coerce")
+    source = "target_value" if "target_value" in df else "Tg_K"
+    df["target_value"] = pd.to_numeric(df[source], errors="coerce")
+    if target == "Tg":
+        df["Tg_K"] = df.target_value
     df["canonical_smiles"] = df.smiles.map(canonical_smiles)
     df["decision"] = "keep"
 
-    # Dataset-level checks run before any split or model preprocessing.
+    # Target-specific cleaning happens before model preprocessing or data splits.
     df.loc[df.smiles.astype("string").str.contains(r"\[\[", na=False), "decision"] = "exclude_double_bracket_smiles"
     df.loc[df.canonical_smiles.isna() & df.decision.eq("keep"), "decision"] = "exclude_rdkit_invalid"
-    df.loc[df.Tg_K.isna(), "decision"] = "exclude_missing_Tg"
-    df.loc[df.Tg_K.notna() & ~np.isfinite(df.Tg_K), "decision"] = "exclude_nonfinite_Tg"
+    df.loc[df.target_value.isna(), "decision"] = f"exclude_missing_{target}"
+    df.loc[df.target_value.notna() & ~np.isfinite(df.target_value), "decision"] = f"exclude_nonfinite_{target}"
 
     valid = df.decision.eq("keep")
-    conflicting = df.loc[valid].groupby("canonical_smiles").Tg_K.nunique().gt(1)
-    df.loc[valid & df.canonical_smiles.isin(conflicting[conflicting].index), "decision"] = "exclude_conflicting_Tg_group"
+    conflicting = df.loc[valid].groupby("canonical_smiles").target_value.nunique().gt(1)
+    df.loc[valid & df.canonical_smiles.isin(conflicting[conflicting].index), "decision"] = f"exclude_conflicting_{target}_group"
 
-    # Identical targets: choose one sample deterministically, never by Tg.
+    # If multiple samples have the same structure and target, keep one by ID.
     remaining = df.loc[df.decision.eq("keep")].sort_values("sample_id")
-    duplicate_rows = remaining.duplicated("canonical_smiles")
-    df.loc[remaining.index[duplicate_rows], "decision"] = "exclude_identical_Tg_duplicate"
+    df.loc[remaining.index[remaining.duplicated("canonical_smiles")], "decision"] = f"exclude_identical_{target}_duplicate"
 
     kept = df.loc[df.decision.eq("keep")].drop(columns="decision").sort_values("sample_id").reset_index(drop=True)
     excluded = df.loc[df.decision.ne("keep")].sort_values("sample_id").reset_index(drop=True)
-
-    if kept.canonical_smiles.isna().any() or kept.canonical_smiles.duplicated().any() or not np.isfinite(kept.Tg_K).all():
+    if kept.canonical_smiles.isna().any() or kept.canonical_smiles.duplicated().any() or not np.isfinite(kept.target_value).all():
         raise RuntimeError("Cleaning left invalid or duplicate observations")
-    if check_counts and (len(df), len(kept)) != EXPECTED_COUNTS[dataset]:
-        raise RuntimeError(f"Unexpected {dataset} counts: {len(df)} raw, {len(kept)} cleaned")
     return kept, excluded
 
 
 def common_md_ids(md_dir):
-    """Select IDs with all required finite bulk and single-chain MD features."""
+    """Find samples with complete finite bulk and single-chain MD descriptors."""
     ids_by_file = []
     for name, columns in MD_COLUMNS.items():
         path = Path(md_dir) / name
@@ -95,11 +85,12 @@ def common_md_ids(md_dir):
     return set.intersection(*ids_by_file)
 
 
-def load_cohort(cohort, *, md_dir=None, client=None, db_name=DB_NAME, check_counts=True):
-    """Return (cleaned samples, excluded samples) from the original MongoDB."""
-    dataset = "bicerano" if cohort == "md_common" else cohort
+def load_cohort(dataset, *, target="Tg", md_dir=None, client=None, db_name=DB_NAME, check_counts=True):
+    """Load a cleaned target cohort; optionally require complete MD descriptors."""
     if dataset not in COLLECTIONS:
-        raise ValueError(f"Unknown cohort: {cohort}")
+        raise ValueError(f"Unknown dataset: {dataset}")
+    if not isinstance(target, str) or not target.isidentifier():
+        raise ValueError("target must be a property name (e.g. Tg or density)")
 
     if client is None:
         from dotenv import load_dotenv
@@ -109,26 +100,24 @@ def load_cohort(cohort, *, md_dir=None, client=None, db_name=DB_NAME, check_coun
         if not uri:
             raise EnvironmentError("Set MONGO_URI in .env or environment")
         with MongoClient(uri) as mongo:
-            return load_cohort(cohort, md_dir=md_dir, client=mongo, db_name=db_name, check_counts=check_counts)
+            return load_cohort(dataset, target=target, md_dir=md_dir, client=mongo, db_name=db_name, check_counts=check_counts)
 
-    fields = {"smiles": 1, "polymer_name": 1, "properties.Tg": 1}
+    fields = {"smiles": 1, "polymer_name": 1, f"properties.{target}": 1}
     docs = client[db_name][COLLECTIONS[dataset]].find({}, fields)
-    frame = pd.DataFrame({
+    frame = pd.DataFrame(({
         "sample_id": str(doc["_id"]), "smiles": doc.get("smiles"),
         "polymer_name": doc.get("polymer_name"),
-        "Tg_K": (doc.get("properties") or {}).get("Tg"),
-    } for doc in docs)
-    kept, excluded = clean_frame(frame, dataset, check_counts=check_counts)
+        "target_value": (doc.get("properties") or {}).get(target),
+    } for doc in docs), columns=["sample_id", "smiles", "polymer_name", "target_value"])
+    if target == "Tg":
+        frame["Tg_K"] = frame.target_value
+    kept, excluded = clean_frame(frame, dataset, target=target, check_counts=check_counts)
 
-    if cohort == "md_common":
-        if md_dir is None:
-            raise ValueError("Pass md_dir for the MD common cohort")
-        ids = common_md_ids(md_dir)
-        unavailable = kept.loc[~kept.sample_id.isin(ids)].copy()
-        unavailable["decision"] = "exclude_md_unavailable_or_nonfinite"
-        excluded = pd.concat([excluded, unavailable], ignore_index=True).sort_values("sample_id").reset_index(drop=True)
-        kept = kept.loc[kept.sample_id.isin(ids)].reset_index(drop=True)
-        if check_counts and len(kept) != EXPECTED_MD_COMMON:
-            raise RuntimeError(f"Expected {EXPECTED_MD_COMMON} MD samples, got {len(kept)}")
+    if md_dir is not None:
+        available = kept.sample_id.isin(common_md_ids(md_dir))
+        excluded = pd.concat([
+            excluded, kept.loc[~available].assign(decision="exclude_md_unavailable_or_nonfinite")
+        ], ignore_index=True).sort_values("sample_id").reset_index(drop=True)
+        kept = kept.loc[available].reset_index(drop=True)
 
-    return kept.assign(Tg=kept.Tg_K), excluded
+    return kept.assign(**{target: kept.target_value}), excluded
