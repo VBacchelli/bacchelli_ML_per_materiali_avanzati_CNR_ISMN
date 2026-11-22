@@ -366,3 +366,198 @@ def benchmark_gbr(frame, manifest, *, fold_ids=None, use_mordred=False, log=None
         })
         log.result("selection_stability", {"jaccard_mean": jaccard})
     return predictions, folds, selected, summary
+
+
+# --- Phase 03 MD extension (append-only; original GBR functions unchanged) ---
+# Uses the existing frozen-split validation, feature selection and regressors.
+import hashlib
+from pathlib import Path
+from joblib import Memory
+from .datasets import MD_COLUMNS
+
+MD_MODES = (
+    "structural_bulk", "structural_single_chain", "structural_bulk_delta",
+    "md_bulk", "md_single_chain", "md_bulk_delta",
+)
+
+
+def md_source_hashes(md_dir):
+    """Hashes of the four source CSVs, to log the exact feature inputs."""
+    md_dir = Path(md_dir)
+    return {name: hashlib.sha256((md_dir / name).read_bytes()).hexdigest()
+            for name in MD_COLUMNS}
+
+
+def load_md_features(md_dir, sample_ids, group):
+    """Read only declared MD columns, align strictly with the frozen sample IDs.
+
+    group: bulk (9, three temperatures) or single_chain (8); never combined.
+    No extrapolation, mean fill, row elimination, reordering, or new splits.
+    """
+    if group not in ("bulk", "single_chain"):
+        raise ValueError(f"Unknown MD group: {group}")
+    ids = pd.Index([str(sid) for sid in sample_ids], name="sample_id")
+    if not ids.is_unique or ids.empty or ids.isna().any():
+        raise ValueError("MD input sample IDs must be unique and nonempty")
+
+    matrices = []
+    for name, columns in MD_COLUMNS.items():
+        kind = "single_chain" if name == "single_chain.csv" else "bulk"
+        if group != kind:
+            continue
+        source = Path(md_dir) / name
+        table = pd.read_csv(source, dtype={"polymer_id": str})
+        missing_columns = {"polymer_id", *columns} - set(table.columns)
+        if missing_columns:
+            raise ValueError(f"Missing columns in {source}: {sorted(missing_columns)}")
+        if table.polymer_id.isna().any() or table.polymer_id.duplicated().any():
+            raise ValueError(f"Missing or duplicate polymer_id in {source}")
+        table = table.set_index("polymer_id", verify_integrity=True)
+        missing_ids = ids.difference(table.index)
+        if not missing_ids.empty:
+            raise ValueError(f"Missing {len(missing_ids)} cohort samples in {source.name}: {missing_ids[:3].tolist()}")
+        values = table.loc[ids, list(columns)].apply(pd.to_numeric, errors="coerce")
+        if not np.isfinite(values.to_numpy(dtype=float)).all():
+            raise ValueError(f"Nonfinite MD values for frozen cohort in {source.name}")
+        values.columns = [f"md__{name}" for name in values.columns]
+        values.index = ids
+        matrices.append(values)
+
+    X = pd.concat(matrices, axis=1)
+    if not X.columns.is_unique or not X.index.equals(ids):
+        raise ValueError("Invalid MD feature matrix: duplicate columns or reordered samples")
+    return X
+
+
+def build_bulk_delta_features(bulk):
+    """Use 300 K reference values and 350 K minus 250 K changes for each bulk property.
+
+    The resulting six predictors do not include absolute 250 K/350 K values.
+    The calculation is target-independent and preserves sample order.
+    """
+    names = ("end_to_end_md", "Rg_md", "density_md")
+    features = pd.DataFrame(index=bulk.index)
+    for name in names:
+        features[f"md__{name}_300"] = bulk[f"md__{name}"]
+        features[f"md__{name}_delta_350_250"] = (
+            bulk[f"md__{name}_350"] - bulk[f"md__{name}_250"]
+        )
+    if features.shape[1] != 6 or not np.isfinite(features.to_numpy(dtype=float)).all():
+        raise ValueError("Invalid bulk delta feature matrix")
+    return features
+
+
+def compose_md_features(frame, md_dir, representation, *, use_mordred=False):
+    """Compose structural+MD or MD-only features, never mixing MD groups."""
+    if representation not in MD_MODES:
+        raise ValueError(f"Invalid MD representation: {representation}")
+    if representation.startswith("md_") and use_mordred:
+        raise ValueError("USE_MORDRED has no meaning for MD-only representations")
+    ids = frame.sample_id.astype(str).tolist()
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate sample_id in cleaned frame")
+    group = "single_chain" if representation in ("structural_single_chain", "md_single_chain") else "bulk"
+    md = load_md_features(md_dir, ids, group)
+    if representation in ("structural_bulk_delta", "md_bulk_delta"):
+        md = build_bulk_delta_features(md)
+
+    if representation.startswith("structural_"):
+        structural = featurize_structures(frame, use_mordred=use_mordred)
+        if not structural.index.equals(md.index):
+            structural = structural.loc[md.index]
+        X = pd.concat([structural, md], axis=1)
+    else:
+        X = md
+    if X.empty or not X.columns.is_unique or not X.index.is_unique or not X.index.equals(md.index):
+        raise ValueError("Feature matrix is empty or has invalid indexes/columns")
+    return X
+
+
+
+
+def benchmark_gbr_md(frame, manifest, *, md_dir, representation, use_mordred=False,
+                     fold_ids=None, log=None, param_grid=None, seed=28, cache_dir=None):
+    """Frozen 5x5 nested CV on an explicit MD feature arm.
+
+    Shares the *same* filter/selector/regressor as the existing GBR. No changes
+    to gbr.py are needed. Returns same four objects, tables and metric keys.
+    """
+    ids, stored_folds = validate_frozen_splits(frame, manifest, fold_ids=fold_ids)
+    if seed != manifest.get("seed"):
+        raise ValueError("The model seed must match the frozen manifest seed")
+    frame = frame.set_index("sample_id", drop=False).loc[ids]
+    X = compose_md_features(frame, md_dir, representation, use_mordred=use_mordred)
+    if not X.index.equals(pd.Index(ids, name="sample_id")):
+        raise ValueError("Feature rows do not match the manifest order")
+    y = frame.target_value.astype(float)
+    if not np.isfinite(y.to_numpy()).all():
+        raise ValueError("Nonfinite target values")
+
+    oof, fold_rows, selected_rows = [], [], []
+    for outer_fold, train_ids, test_ids in stored_folds:
+        inner_cv = frozen_inner_cv(manifest, outer_fold, train_ids)
+        pipeline = Pipeline([
+            ("filter", FeatureFilter()),
+            ("select", MIPermutationSelector(seed=seed)),
+            ("gbr", GradientBoostingRegressor(random_state=seed)),
+        ], memory=Memory(location=cache_dir, verbose=0) if cache_dir else None)
+        search = GridSearchCV(pipeline, param_grid or PARAM_GRID,
+                              scoring="neg_mean_absolute_error", cv=inner_cv,
+                              n_jobs=1, refit=True)
+        start = perf_counter()
+        search.fit(X.loc[train_ids], y.loc[train_ids])
+        elapsed = perf_counter() - start
+        prediction = search.predict(X.loc[test_ids])
+        chosen = search.best_estimator_.named_steps["select"].selected_
+        selected_rows.extend({"fold": outer_fold, "feature": feature} for feature in chosen)
+        oof.extend({"sample_id": sid, "fold": outer_fold,
+                    "y_true": float(y.loc[sid]), "y_pred": float(pred)}
+                   for sid, pred in zip(test_ids, prediction))
+        mae = mean_absolute_error(y.loc[test_ids], prediction)
+        fold_rows.append({
+            "fold": outer_fold, "n_train": len(train_ids), "n_test": len(test_ids),
+            "n_selected": len(chosen), "inner_MAE": -search.best_score_,
+            "MAE": mae, "R2": r2_score(y.loc[test_ids], prediction),
+            "MAE_over_sigma": mae / y.std(ddof=1),
+            "fit_seconds": elapsed, "best_params": str(search.best_params_),
+        })
+
+    predictions = pd.DataFrame(oof).sort_values("sample_id").reset_index(drop=True)
+    folds = pd.DataFrame(fold_rows)
+    selected = pd.DataFrame(selected_rows)
+    if (len(predictions) != len(ids) or predictions.sample_id.duplicated().any()
+            or set(predictions.sample_id) != set(ids)):
+        raise ValueError("OOF predictions do not cover all frozen samples exactly once")
+    selected_sets = [set(selected.loc[selected.fold.eq(k), "feature"]) for k in range(1, 6)]
+    jaccard = float(np.mean([
+        len(a & b) / len(a | b) if a | b else 1.0
+        for a, b in combinations(selected_sets, 2)
+    ]))
+    mae = mean_absolute_error(predictions.y_true, predictions.y_pred)
+    summary = {
+        "n_samples": len(ids), "n_outer": 5, "n_inner": 5,
+        "MAE": float(mae), "R2": float(r2_score(predictions.y_true, predictions.y_pred)),
+        "MAE_over_sigma": float(mae / y.std(ddof=1)),
+        "fold_MAE_mean": float(folds.MAE.mean()),
+        "fold_MAE_std": float(folds.MAE.std(ddof=1)),
+        "selection_jaccard": jaccard, "fit_seconds": float(folds.fit_seconds.sum()),
+    }
+    if log is not None:
+        log.dataset(n_polymers=len(ids), target_min=y.min(), target_max=y.max(),
+                    target_mean=y.mean(), target_std=y.std(ddof=1))
+        log.table("oof_predictions", predictions, index=False)
+        log.table("nested_cv_folds", folds, index=False)
+        log.table("selected_features", selected, index=False)
+        counts = selected.feature.value_counts().rename_axis("feature").reset_index(name="n_folds")
+        counts["frequency"] = counts.n_folds / 5
+        log.table("selection_stability", counts, index=False)
+        log.result("nested_cv", {
+            **summary,
+            "base_MAE_mean": float(folds.MAE.mean()),
+            "base_MAE_std": float(folds.MAE.std(ddof=1)),
+            "base_R2_mean": float(folds.R2.mean()),
+            "base_R2_std": float(folds.R2.std(ddof=1)),
+        })
+        log.result("selection_stability", {"jaccard_mean": jaccard})
+    return predictions, folds, selected, summary
+
